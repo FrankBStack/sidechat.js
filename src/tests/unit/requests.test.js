@@ -278,14 +278,116 @@ test("getPostComments flattens replies directly after their parent", async () =>
 });
 
 // ---------------------------------------------------------------------------
-// Error handling. This documents current behaviour so a later change to a
-// shared request helper can flip it to the intended behaviour deliberately.
+// Error handling
 // ---------------------------------------------------------------------------
 
-test("[current behaviour] HTTP errors are not surfaced with the server message", async () => {
+test("non-2xx responses throw a SidechatAPIError carrying the server message and status", async () => {
   stubFetch(401, { message: "Unauthorized" });
   const api = client();
-  assert.equal(await api.getPost("p1"), undefined);
-  await assert.rejects(() => api.getDMs(), { message: "Failed to fetch DMs." });
-  await assert.rejects(() => api.createPost("x", "g"), { message: "Failed to make post." });
+  await assert.rejects(() => api.getPost("p1"), (err) => {
+    assert.equal(err.name, "SidechatAPIError");
+    assert.equal(err.message, "Unauthorized");
+    assert.equal(err.status, 401);
+    assert.deepEqual(err.response, { message: "Unauthorized" });
+    return true;
+  });
+  await assert.rejects(() => api.getDMs(), { message: "Unauthorized", status: 401 });
+  await assert.rejects(() => api.createPost("x", "g"), { message: "Unauthorized", status: 401 });
+});
+
+test("non-2xx responses without a message fall back to a method-specific message", async () => {
+  stubFetch(500, {});
+  await assert.rejects(() => client().getDMs(), {
+    name: "SidechatAPIError",
+    message: "Failed to fetch DMs. (HTTP 500)",
+    status: 500,
+  });
+});
+
+test("verifySMSCode does not set a token when the server rejects the code", async () => {
+  stubFetch(400, { message: "Invalid code" });
+  const api = new SidechatAPIClient("", ROOT);
+  await assert.rejects(() => api.verifySMSCode("5555555555", "bad"), { message: "Invalid code" });
+  assert.equal(api.userToken, undefined);
+});
+
+test("network failures are wrapped in a SidechatAPIError", async () => {
+  globalThis.fetch = async () => {
+    throw new TypeError("fetch failed");
+  };
+  await assert.rejects(() => client().getPost("p1"), (err) => {
+    assert.equal(err.name, "SidechatAPIError");
+    assert.match(err.message, /Failed to get post from ID\. \(fetch failed\)/);
+    assert.equal(err.status, undefined);
+    return true;
+  });
+});
+
+test("registerEmail surfaces the server message from a 200 response with a message field", async () => {
+  stubFetch(200, { message: "Email domain not allowed" });
+  await assert.rejects(() => client().registerEmail("a@b.edu"), { message: "Email domain not allowed" });
+});
+
+test("checkUsername returns false on a non-2xx response instead of throwing", async () => {
+  stubFetch(409, { message: "Username taken" });
+  assert.equal(await client().checkUsername("bob"), false);
+  stubFetch(204, null);
+  assert.equal(await client().checkUsername("bob"), true);
+});
+
+test("unauthenticated requests do not send an Authorization header", async () => {
+  stubFetch(200, {});
+  await new SidechatAPIClient("", ROOT).loginViaSMS("5555555555");
+  assert.equal("Authorization" in onlyCall().headers, false);
+});
+
+// ---------------------------------------------------------------------------
+// URL encoding
+// ---------------------------------------------------------------------------
+
+test("query parameters and path segments are URL-encoded", async () => {
+  stubFetch(200, { group: {}, posts: [] });
+  const api = client();
+  await api.getUserPosts("weird name&x=1");
+  await api.getGroupMetadata("id/with slash");
+  assert.equal(parse(calls[0].url).query.username, "weird name&x=1");
+  assert.equal(parse(calls[1].url).path, "/v1/groups/id%2Fwith%20slash");
+});
+
+// ---------------------------------------------------------------------------
+// sendRequest
+// ---------------------------------------------------------------------------
+
+test("sendRequest JSON-encodes object bodies and honours stripHeaders", async () => {
+  stubFetch(200, {});
+  const api = client();
+  await api.sendRequest("/v1/custom", "POST", { a: 1 }, { "X-Custom": "y" }, true);
+  const c = onlyCall();
+  assert.equal(c.body, JSON.stringify({ a: 1 }));
+  assert.equal(c.headers["X-Custom"], "y");
+  assert.equal(c.headers.Authorization, `Bearer ${TOKEN}`);
+  assert.equal("Accept" in c.headers, false);
+});
+
+test("sendRequest passes string bodies through untouched", async () => {
+  stubFetch(200, {});
+  await client().sendRequest("/v1/custom", "POST", "raw");
+  assert.equal(onlyCall().body, "raw");
+});
+
+// ---------------------------------------------------------------------------
+// Comment tree ordering when replies arrive before parents
+// ---------------------------------------------------------------------------
+
+test("getPostComments nests a reply even when it arrives before its parent", async () => {
+  const P = "post";
+  stubFetch(200, {
+    posts: [
+      { id: "c1a", parent_post_id: P, reply_post_id: "c1" },
+      { id: "c1", parent_post_id: P, reply_post_id: P },
+      { id: "c2", parent_post_id: P, reply_post_id: P },
+    ],
+  });
+  const out = await client().getPostComments(P);
+  assert.deepEqual(out.map((c) => c.id), ["c1", "c1a", "c2"]);
 });
